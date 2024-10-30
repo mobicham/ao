@@ -100,9 +100,7 @@ def generate(
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
-
-    global do_capture_graph
-
+    
     # create an empty tensor of the expected final shape and fill in the current tokens
     device = prompt.device
     T = prompt.size(-1)
