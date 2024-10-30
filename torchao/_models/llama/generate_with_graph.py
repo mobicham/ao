@@ -58,25 +58,56 @@ def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **samp
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+static_inputs     = None
+static_outputs   = None
+cuda_graph       = None
+do_capture_graph = False
+capture_counter  = 0
+
+def decode_one_token_base(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    with sdpa_kernel([SDPBackend.MATH]):
+        out = sample(model(x, input_pos), **sampling_kwargs)
+    return out
+
+def decode_one_token_raw(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
-    logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)
+    return decode_one_token_base(model, x, input_pos, **sampling_kwargs)
+
+def decode_one_token_with_graph(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    global do_capture_graph, cuda_graph, capture_counter
+
+    static_inputs.copy_(x)
+    if(do_capture_graph):
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cuda_graph):
+            static_outputs[0], static_outputs[1] = decode_one_token_base(model, static_inputs, input_pos, **sampling_kwargs)
+        capture_counter += 1
+    else:
+        cuda_graph.replay()
+
+    if(capture_counter >= 3):
+        do_capture_graph = False
+
+    return static_outputs
+
+decode_one_token = decode_one_token_raw #Default
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
-        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
-            next_token, next_prob = decode_one_token(
-                model, cur_token, input_pos, **sampling_kwargs
-            )
-            next_token, next_prob = next_token.clone(), next_prob.clone()
-            input_pos += 1
-            new_tokens.append(next_token)
-            callback(new_tokens[-1])
-            new_probs.append(next_prob)
-            cur_token = next_token
+        next_token, next_prob = decode_one_token(
+            model, cur_token, input_pos, **sampling_kwargs
+        )
+        next_token, next_prob = next_token.clone(), next_prob.clone()
+        input_pos += 1
+        new_tokens.append(next_token)
+        callback(new_tokens[-1])
+        new_probs.append(next_prob)
+        cur_token = next_token
 
     return new_tokens, new_probs
 
@@ -400,9 +431,32 @@ def main(
     if compile:
         print("Compiling Model")
         global decode_one_token, prefill
-        decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
+        
+        #decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
 
-        #Warmup 2: for compile
+        #Enable manual cuda graph
+        global decode_one_token_base
+        decode_one_token_base = torch.compile(decode_one_token_base, mode="max-autotune-no-cudagraphs", fullgraph=True)
+
+        #Warmup 2: for torch.compile
+        generate(
+            model,
+            encode_tokens(tokenizer, prompt, bos=True, device=device),
+            max_new_tokens,
+            batch_size,
+            interactive=False,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        print("Capture")
+        global decode_one_token_with_graph, do_capture_graph, static_inputs, static_outputs
+        static_inputs    = torch.zeros((batch_size, 1), device=device, dtype=torch.int32)
+        static_outputs   = [torch.zeros((batch_size, 1), device=device, dtype=torch.int32), torch.zeros((1, 1), device=device, dtype=torch.float32)]
+        do_capture_graph = True
+        decode_one_token = decode_one_token_with_graph
+
+        #Warmup 3: for cuda graph
         generate(
             model,
             encode_tokens(tokenizer, prompt, bos=True, device=device),
