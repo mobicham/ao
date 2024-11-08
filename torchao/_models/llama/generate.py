@@ -151,6 +151,34 @@ def _load_model(checkpoint_path, device, precision):
 
     return model.eval()
 
+
+##########################################################################################################
+@torch.library.custom_op("generate::matmul_torch_A16W8SYM", mutates_args=())
+def matmul_torch_A16W8SYM(x: torch.Tensor, W_q: torch.Tensor, scales: torch.Tensor, out_features: int) -> torch.Tensor:
+    out_shape = x.shape[:-1] + (out_features,)
+    out = ((x.view((-1, x.shape[-1])) @ W_q.T.to(x.dtype)) * scales.view(1, -1)).view(out_shape)
+    return out
+
+@torch.library.register_fake("generate::matmul_torch_A16W8SYM")
+def matmul_torch_A16W8SYM_fake(x: torch.Tensor, W_q: torch.Tensor, scales: torch.Tensor, out_features: int) -> torch.Tensor:
+    out_shape = x.shape[:-1] + (out_features,)
+    return torch.empty(out_shape, dtype=x.dtype, device=x.device)
+
+matmul_torch_A16W8SYM = torch.compile(matmul_torch_A16W8SYM)
+
+class TorchInt8Layer(torch.nn.Module):
+    def __init__(self, W_q, scales, in_features, out_features):
+        super().__init__()
+        self.W_q = W_q
+        self.scales = scales
+        self.in_features = in_features
+        self.out_features = out_features
+        self.device = W_q.device
+
+    def forward(self, x):
+        return matmul_torch_A16W8SYM(x, self.W_q, self.scales, self.out_features)
+###########################################################################################################
+
 B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
@@ -238,7 +266,11 @@ def main(
 
             quant_config = BaseQuantizeConfig(nbits=W_nbits, group_size=group_size, quant_zero=False, quant_scale=False, axis=1)
 
-            set_autotune({'GEMV_REVSPLITK':True, 'GEMV':True, 'GEMM_SPLITK':True, 'GEMM':True}, exhaustive=False, use_cuda_graph=False)
+            #set_autotune({'GEMV_REVSPLITK':True, 'GEMV':True, 'GEMV_SPLITK': True, 'GEMM_SPLITK':True, 'GEMM':True}, exhaustive=False, use_cuda_graph=False)
+            #set_autotune({'GEMV_REVSPLITK':False, 'GEMV':False, 'GEMV_SPLITK': False, 'GEMM_SPLITK':False, 'GEMM':False}, exhaustive=False, use_cuda_graph=False)
+            #set_autotune({'GEMV_REVSPLITK':True, 'GEMV':True, 'GEMV_SPLITK': False, 'GEMM_SPLITK':False, 'GEMM':False}, exhaustive=False, use_cuda_graph=False)
+            set_autotune({'GEMV_REVSPLITK':True, 'GEMV':True, 'GEMV_SPLITK': True, 'GEMM_SPLITK':True, 'GEMM':True}, exhaustive=False, use_cuda_graph=False)
+
 
             def replace_fn(mod, quant_config=quant_config):
                 if not isinstance(mod, torch.nn.Linear):
@@ -248,33 +280,135 @@ def main(
                 out_features = mod.out_features                
                 compute_dtype = mod.weight.dtype
 
-                #HQQ quantize
-                hqq_layer = HQQLinear(mod, quant_config=quant_config, compute_dtype=compute_dtype, device=device, del_orig=False)
+                if(quant_config['weight_quant_params']['nbits'] == 8):
 
-                quant_config = hqq_layer.quant_config
+                    bias   = mod.bias.to(dtype=torch.float16, device=device) if (mod.bias is not None) else None
+                    weight = mod.weight.data.float()
+                    scales = torch.abs(weight).amax(axis=1, keepdim=True) / 127.0
+                    W_q    = torch.round(weight / scales).to(device=device, dtype=torch.int8)
+                    scales = scales.to(device=device, dtype=compute_dtype)
 
-                if(hqq_layer.meta["group_size"] is None):
-                    hqq_layer.meta["group_size"] = hqq_layer.in_features
+                    #########################################################
 
-                gemlite_linear = GemLiteLinearTriton(hqq_layer.meta["nbits"], 
-                                group_size=hqq_layer.meta["group_size"], 
-                                in_features=hqq_layer.in_features, 
-                                out_features=hqq_layer.out_features, 
-                                input_dtype=DType.FP16, 
-                                output_dtype=DType.FP16, 
-                                )
 
-                orig_shape = hqq_layer.meta['shape']
-                W_q        = hqq_layer.unpack(dtype=torch.uint8).view(orig_shape) #Expects uint8 for Wn quantization!
-                scales     = hqq_layer.meta['scale'].clone()
-                zeros      = hqq_layer.meta['zero'].clone()
-                bias       = hqq_layer.bias.clone() if (hqq_layer.bias is not None) else None  
-                gemlite_linear.pack(W_q, scales, zeros, bias=bias, fma_mode=False)
+                    #gemlite_linear = TorchInt8Layer(W_q.to(device), scales, in_features=in_features, out_features=out_features)
 
-                del hqq_layer.W_q
-                del hqq_layer.meta
-                del hqq_layer
-                torch.cuda.empty_cache()
+
+                    #########################################################
+                    from gemlite.core import GEMLITE_ACC_DTYPE
+
+                    gemlite_linear = GemLiteLinearTriton(8, 
+                                    group_size=in_features, 
+                                    in_features=in_features, 
+                                    out_features=out_features, 
+                                    input_dtype=DType.FP16, 
+                                    output_dtype=DType.FP16, 
+                                    )
+
+
+
+                    #########################################################
+                    #BITPACKING : TUNING FOR THE A100 SXM4
+
+                    # #A16W8 - Symmmetric - With Bitpacking = More accurate wiht (3, 0) - mode, but slower on the A100 due to the tl.load packing issue 
+                    # gemlite_linear.pack((W_q.int() + 128).to(dtype=torch.uint8, device=device), scales, zeros=128, bias=bias, contiguous=True)  #USE THIS WITH GEMV_REVSPLITK with contiguous=True
+                    # #gemlite_linear.pack((W_q.int() + 128).to(dtype=torch.uint8, device=device), scales, zeros=128 * torch.ones_like(scales), bias=bias, contiguous=True) #True
+                    # gemlite_linear.W_group_mode = 3 
+                    # gemlite_linear.channel_scale_mode = 0 
+                    # gemlite_linear.default_gemv = 'GEMV_REVSPLITK'
+
+                    #########################################################
+                    #NO BITPACKING: TUNING FOR THE A100 SXM4
+
+                    # #A16W8 - Symmmetric - NO Bitpacking - Faster - but with need to use FP32 for more accurate results since we accumulate with a wide int8 range
+                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False) #USE THIS WITH GEMV_SPLITK with contiguous=False
+                    # gemlite_linear.W_group_mode = 0
+                    # gemlite_linear.channel_scale_mode = 1 
+                    # gemlite_linear.meta_dtype = DType.FP32 #We need to cast the scales to fp32 since the accumulator with A16W8 has a higher range
+                    # gemlite_linear.default_gemv = 'GEMV_SPLITK'
+
+                    # #A16W8 - Symmetric - No Bitpacking - uses local scaling, so no need for FP32
+                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=True) #USE THIS WITH GEMV with contiguous=True -BEST
+                    # gemlite_linear.W_group_mode = 2
+                    # gemlite_linear.channel_scale_mode = 0 
+                    # gemlite_linear.default_gemv = 'GEMV'
+
+                    # #A16W8 - Symmetric - No Bitpacking - uses local scaling, so no need for FP32
+                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=True) #USE THIS WITH GEMV with contiguous=True
+                    # gemlite_linear.W_group_mode = 2
+                    # gemlite_linear.channel_scale_mode = 0 
+                    # gemlite_linear.default_gemv = 'GEMV'
+
+
+                    # #Batched  -> (GEMM_SPLITK / GEMM) - BEST
+                    gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False)
+                    gemlite_linear.W_group_mode = 2
+                    gemlite_linear.channel_scale_mode = 0
+                    gemlite_linear.default_gemv = 'GEMV_SPLITK'
+
+                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False)
+                    # gemlite_linear.W_group_mode = 0
+                    # gemlite_linear.channel_scale_mode = 1 
+                    # gemlite_linear.acc_dtype  = DType.FP32 
+                    # gemlite_linear.meta_dtype = DType.FP32 
+                    # gemlite_linear.default_gemv = 'GEMV_SPLITK'
+
+
+                    #########################################################
+                    # #Test
+                    # x     = torch.randn((1, in_features), dtype=compute_dtype, device=device) / 10.
+                    # y_ref = torch.matmul(x, weight.to(device=device, dtype=compute_dtype).T)
+                    # y_gem = gemlite_linear(x)
+                    # err   = (y_ref - y_gem).abs().mean().item()
+                    # tol   = 2e-3
+                    # assert err < tol, str(err) + ', expected < ' + str(tol)
+                    # #print(err)
+                    #########################################################
+
+                    #Cleanup
+                    #del W_q, weight
+                    torch.cuda.empty_cache()
+
+                else:
+
+                    #HQQ quantize
+                    hqq_layer = HQQLinear(mod, quant_config=quant_config, compute_dtype=compute_dtype, device=device, del_orig=False)
+
+                    quant_config = hqq_layer.quant_config
+
+                    if(hqq_layer.meta["group_size"] is None):
+                        hqq_layer.meta["group_size"] = hqq_layer.in_features
+
+                    gemlite_linear = GemLiteLinearTriton(hqq_layer.meta["nbits"], 
+                                    group_size=hqq_layer.meta["group_size"], 
+                                    in_features=hqq_layer.in_features, 
+                                    out_features=hqq_layer.out_features, 
+                                    input_dtype=DType.FP16, 
+                                    output_dtype=DType.FP16, 
+                                    )
+
+                    orig_shape = hqq_layer.meta['shape']
+                    W_q        = hqq_layer.unpack(dtype=torch.uint8).view(orig_shape) #Expects uint8 for Wn quantization!
+                    scales     = hqq_layer.meta['scale'].clone()
+                    zeros      = hqq_layer.meta['zero'].clone()
+                    bias       = hqq_layer.bias.clone() if (hqq_layer.bias is not None) else None  
+
+                    gemlite_linear.pack(W_q, scales, zeros, bias=bias, contiguous=True) 
+                    gemlite_linear.default_gemv = 'GEMV_REVSPLITK' 
+
+                    if(hqq_layer.meta["group_size"] == hqq_layer.in_features):
+                        ## Keep using pre-scaling
+                        gemlite_linear.W_group_mode = 3
+                        gemlite_linear.channel_scale_mode = 0
+
+                        # #Switch to this??
+                        # gemlite_linear.W_group_mode = 1
+                        # gemlite_linear.channel_scale_mode = 1
+
+                    del hqq_layer.W_q
+                    del hqq_layer.meta
+                    del hqq_layer
+                    torch.cuda.empty_cache()
 
                 return gemlite_linear
                 
