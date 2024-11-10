@@ -397,11 +397,11 @@ def main(
                     gemlite_linear.default_gemv = 'GEMV_REVSPLITK' 
 
                     if(hqq_layer.meta["group_size"] == hqq_layer.in_features):
-                        ## Keep using pre-scaling
+                        ## Keep using pre-scaling on the A100 / H100 (?) AND batch-size = 1 for GEMV_REVSPLITK
                         gemlite_linear.W_group_mode = 3
                         gemlite_linear.channel_scale_mode = 0
 
-                        # #Switch to this??
+                        # #Switch to this for the 3090 / 4090 / A6000 Ada for batch-size > 1
                         # gemlite_linear.W_group_mode = 1
                         # gemlite_linear.channel_scale_mode = 1
 
