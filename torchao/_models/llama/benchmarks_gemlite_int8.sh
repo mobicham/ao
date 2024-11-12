@@ -20,9 +20,9 @@ for batch_size in 1 4 8 16 32 64 128; do
 	
 	#A16W4 - grouped
 	#----------------
-	python generate.py --checkpoint_path $CHECKPOINT_PATH/$MODEL_REPO/model.pth --quantization int4wo-$group_size --write_result $output_file --compile --batch_size $batch_size;
+	#python generate.py --checkpoint_path $CHECKPOINT_PATH/$MODEL_REPO/model.pth --quantization int4wo-$group_size --write_result $output_file --compile --batch_size $batch_size;
 	
-	#python generate.py --checkpoint_path $CHECKPOINT_PATH/$MODEL_REPO/model.pth --precision float16 --quantization gemlite-4-$group_size --write_result $output_file --compile --batch_size $batch_size;
+	python generate.py --checkpoint_path $CHECKPOINT_PATH/$MODEL_REPO/model.pth --precision float16 --quantization gemlite-4-$group_size --write_result $output_file --compile --batch_size $batch_size;
 	
 	#A16W4 - channelwise
 	#----------------
