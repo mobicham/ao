@@ -393,7 +393,7 @@ def main(
                     zeros      = hqq_layer.meta['zero'].clone()
                     bias       = hqq_layer.bias.clone() if (hqq_layer.bias is not None) else None  
 
-                    gemlite_linear.pack(W_q, scales, zeros, bias=bias, contiguous=True) 
+                    gemlite_linear.pack(W_q, scales, zeros, bias=bias, contiguous=True, packing_bitwidth=32) #32 / 8
                     gemlite_linear.default_gemv = 'GEMV_REVSPLITK' 
 
                     if(hqq_layer.meta["group_size"] == hqq_layer.in_features):
