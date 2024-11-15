@@ -416,6 +416,10 @@ def main(
             _replace_with_custom_fn_if_matches_filter(model, replace_fn, _is_linear)
             gc.collect()
 
+            #Load cache 
+            GemLiteLinearTriton.load_config('test_config.json')
+            print('Cache loaded!')
+
             #Warmup 1: for autotune
             generate(
                 model,
@@ -426,6 +430,11 @@ def main(
                 temperature=temperature,
                 top_k=top_k,
             )
+
+            #Save cache 
+            GemLiteLinearTriton.cache_config('test_config.json')
+            print('Cache saved!')
+
 
         if "int8wo" in quantization:
             quantize_(model, int8_weight_only())
@@ -671,7 +680,6 @@ def main(
         f=open(write_result, "a")
         f.write(result_txt)
         f.close()
-
 
 
 if __name__ == '__main__':
