@@ -251,7 +251,7 @@ def main(
             from torchao.prototype.spinquant import apply_spinquant
             apply_spinquant(model)
         if "gemlite" in quantization:
-            from gemlite.core import GemLiteLinearTriton, DType, set_autotune
+            from gemlite.core import GemLiteLinearTriton, DType, set_autotune, GEMLITE_ACC_DTYPE
             from torchao.quantization.quant_api import _replace_with_custom_fn_if_matches_filter, _is_linear
             from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
 
@@ -283,19 +283,18 @@ def main(
                 if(quant_config['weight_quant_params']['nbits'] == 8):
 
                     bias   = mod.bias.to(dtype=torch.float16, device=device) if (mod.bias is not None) else None
+
+
+                
+                    #NO BITPACKING: 
+                    #########################################################
+                    #A16W8
+                    GEMLITE_ACC_DTYPE[DType.FP16] = DType.FP32
+
                     weight = mod.weight.data.float()
                     scales = torch.abs(weight).amax(axis=1, keepdim=True) / 127.0
                     W_q    = torch.round(weight / scales).to(device=device, dtype=torch.int8)
                     scales = scales.to(device=device, dtype=compute_dtype)
-
-                    #########################################################
-
-
-                    #gemlite_linear = TorchInt8Layer(W_q.to(device), scales, in_features=in_features, out_features=out_features)
-
-
-                    #########################################################
-                    from gemlite.core import GEMLITE_ACC_DTYPE
 
                     gemlite_linear = GemLiteLinearTriton(8, 
                                     group_size=in_features, 
@@ -305,68 +304,51 @@ def main(
                                     output_dtype=DType.FP16, 
                                     )
 
-
-
-                    #########################################################
-                    #BITPACKING : TUNING FOR THE A100 SXM4
-
-                    # #A16W8 - Symmmetric - With Bitpacking = More accurate wiht (3, 0) - mode, but slower on the A100 due to the tl.load packing issue 
-                    # gemlite_linear.pack((W_q.int() + 128).to(dtype=torch.uint8, device=device), scales, zeros=128, bias=bias, contiguous=True)  #USE THIS WITH GEMV_REVSPLITK with contiguous=True
-                    # #gemlite_linear.pack((W_q.int() + 128).to(dtype=torch.uint8, device=device), scales, zeros=128 * torch.ones_like(scales), bias=bias, contiguous=True) #True
-                    # gemlite_linear.W_group_mode = 3 
-                    # gemlite_linear.channel_scale_mode = 0 
-                    # gemlite_linear.default_gemv = 'GEMV_REVSPLITK'
-
-                    #########################################################
-                    #NO BITPACKING: TUNING FOR THE A100 SXM4
-
-                    # #A16W8 - Symmmetric - NO Bitpacking - Faster - but with need to use FP32 for more accurate results since we accumulate with a wide int8 range
-                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False) #USE THIS WITH GEMV_SPLITK with contiguous=False
-                    # gemlite_linear.W_group_mode = 0
-                    # gemlite_linear.channel_scale_mode = 1 
-                    # gemlite_linear.meta_dtype = DType.FP32 #We need to cast the scales to fp32 since the accumulator with A16W8 has a higher range
-                    # gemlite_linear.default_gemv = 'GEMV_SPLITK'
-
-                    # #A16W8 - Symmetric - No Bitpacking - uses local scaling, so no need for FP32
-                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=True) #USE THIS WITH GEMV with contiguous=True -BEST
-                    # gemlite_linear.W_group_mode = 2
-                    # gemlite_linear.channel_scale_mode = 0 
-                    # gemlite_linear.default_gemv = 'GEMV'
-
-                    # #A16W8 - Symmetric - No Bitpacking - uses local scaling, so no need for FP32
-                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=True) #USE THIS WITH GEMV with contiguous=True
-                    # gemlite_linear.W_group_mode = 2
-                    # gemlite_linear.channel_scale_mode = 0 
-                    # gemlite_linear.default_gemv = 'GEMV'
-
-
-                    # #Batched  -> (GEMM_SPLITK / GEMM) - BEST
                     gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False)
                     gemlite_linear.W_group_mode = 2
                     gemlite_linear.channel_scale_mode = 0
                     gemlite_linear.default_gemv = 'GEMV_SPLITK'
 
-                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False)
+                    #########################################################
+                    # # A8W8 dynamic
+                    # stability_scaling = 1.
+
+                    # weight = mod.weight.data.float()
+                    # scales = torch.abs(weight).amax(axis=1, keepdim=True) / 127.0
+                    # W_q    = torch.round(weight / scales).to(device=device, dtype=torch.int8)
+                    # scales = scales.to(device=device, dtype=compute_dtype)
+
+                    # gemlite_linear = GemLiteLinearTriton(8, 
+                    #                 group_size=in_features, 
+                    #                 in_features=in_features, 
+                    #                 out_features=out_features, 
+                    #                 input_dtype=DType.INT8, #INT8
+                    #                 output_dtype=DType.FP16,  
+                    #                 )
+
+                    # def scale_fct(x):
+                    #     out_x    = x / stability_scaling
+                    #     ##################################
+
+                    #     scaled_x = torch.abs(out_x).amax(axis=0, keepdim=True) / 127.0
+                    #     out_x    = torch.round(out_x / scaled_x).to(dtype=torch.int8)
+
+                    #     ##################################
+                    #     # scaled_x = torch.ones((1, out_x.shape[1]), dtype=torch.float16, device=x.device)
+                    #     ##################################
+
+                    #     return out_x, scaled_x
+
+                    # gemlite_linear.scale_activations = scale_fct
+
+                    # gemlite_linear.pack(W_q, scales * stability_scaling, zeros=None, bias=bias, contiguous=False)
                     # gemlite_linear.W_group_mode = 0
-                    # gemlite_linear.channel_scale_mode = 1 
-                    # gemlite_linear.acc_dtype  = DType.FP32 
-                    # gemlite_linear.meta_dtype = DType.FP32 
+                    # gemlite_linear.channel_scale_mode = 3 #activation/weight-
                     # gemlite_linear.default_gemv = 'GEMV_SPLITK'
 
-
-                    #########################################################
-                    # #Test
-                    # x     = torch.randn((1, in_features), dtype=compute_dtype, device=device) / 10.
-                    # y_ref = torch.matmul(x, weight.to(device=device, dtype=compute_dtype).T)
-                    # y_gem = gemlite_linear(x)
-                    # err   = (y_ref - y_gem).abs().mean().item()
-                    # tol   = 2e-3
-                    # assert err < tol, str(err) + ', expected < ' + str(tol)
-                    # #print(err)
                     #########################################################
 
-                    #Cleanup
-                    #del W_q, weight
+
                     torch.cuda.empty_cache()
 
                 else:
@@ -417,11 +399,11 @@ def main(
             gc.collect()
 
             #Load cache 
-            GemLiteLinearTriton.load_config('test_config.json')
-            print('Cache loaded!')
+            # GemLiteLinearTriton.load_config('test_config.json')
+            # print('Cache loaded!')
 
             #Warmup 1: for autotune
-            generate(
+            out = generate(
                 model,
                 encode_tokens(tokenizer, prompt, bos=True, device=device),
                 max_new_tokens,
@@ -431,9 +413,11 @@ def main(
                 top_k=top_k,
             )
 
+            print(out.min())
+
             #Save cache 
-            GemLiteLinearTriton.cache_config('test_config.json')
-            print('Cache saved!')
+            # GemLiteLinearTriton.cache_config('test_config.json')
+            # print('Cache saved!')
 
 
         if "int8wo" in quantization:
