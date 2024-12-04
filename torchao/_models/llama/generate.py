@@ -395,8 +395,8 @@ def main(
             gc.collect()
 
             #Load cache 
-            # GemLiteLinearTriton.load_config('test_config.json')
-            # print('Cache loaded!')
+            GemLiteLinearTriton.load_config('test_config.json')
+            print('Cache loaded!')
 
             #Warmup 1: for autotune
             out = generate(
@@ -412,8 +412,8 @@ def main(
             print(out.min())
 
             #Save cache 
-            # GemLiteLinearTriton.cache_config('test_config.json')
-            # print('Cache saved!')
+            GemLiteLinearTriton.cache_config('test_config.json')
+            print('Cache saved!')
 
 
         if "int8wo" in quantization:
