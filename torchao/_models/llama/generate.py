@@ -251,6 +251,7 @@ def main(
             from torchao.prototype.spinquant import apply_spinquant
             apply_spinquant(model)
         if "gemlite" in quantization:
+            import gemlite
             from gemlite.core import GemLiteLinearTriton, DType, set_autotune, GEMLITE_ACC_DTYPE
             from torchao.quantization.quant_api import _replace_with_custom_fn_if_matches_filter, _is_linear
             from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
@@ -272,6 +273,10 @@ def main(
             set_autotune({'GEMV_REVSPLITK':True, 'GEMV':True, 'GEMV_SPLITK': True, 'GEMM_SPLITK':True, 'GEMM':True}, exhaustive=False, use_cuda_graph=False)
 
 
+            GEMLITE_ACC_DTYPE[DType.FP16] = DType.FP32 #For A100/H100
+            gemlite.core.GEMLITE_TRITON_RESTRICT_M = True #Faster autotune 
+
+
             def replace_fn(mod, quant_config=quant_config):
                 if not isinstance(mod, torch.nn.Linear):
                     return mod
@@ -281,67 +286,63 @@ def main(
                 compute_dtype = mod.weight.dtype
 
                 if(quant_config['weight_quant_params']['nbits'] == 8):
-
                     bias   = mod.bias.to(dtype=torch.float16, device=device) if (mod.bias is not None) else None
-
 
                     #NO BITPACKING: 
                     #########################################################
-                    # #A16W8
-                    # #GEMLITE_ACC_DTYPE[DType.FP16] = DType.FP32
-
-                    # weight = mod.weight.data.float()
-                    # scales = torch.abs(weight).amax(axis=1, keepdim=True) / 127.0
-                    # W_q    = torch.round(weight / scales).to(device=device, dtype=torch.int8)
-                    # scales = scales.to(device=device, dtype=compute_dtype)
-
-                    # gemlite_linear = GemLiteLinearTriton(8, 
-                    #                 group_size=in_features, 
-                    #                 in_features=in_features, 
-                    #                 out_features=out_features, 
-                    #                 input_dtype=DType.FP16, 
-                    #                 output_dtype=DType.FP16, 
-                    #                 )
-
-                    # gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False)
-                    # gemlite_linear.W_group_mode = 2
-                    # gemlite_linear.channel_scale_mode = 0
-                    # gemlite_linear.default_gemv = 'GEMV_SPLITK'
-
-                    ##########################################################
-                    #A8W8 Dynamic quantization
-                    w_dtype, input_dtype, max_val = torch.int8, DType.INT8, 127
-                    #w_dtype, input_dtype, max_val = torch.float8_e4m3fn, DType.FP8, 448
-                    #w_dtype, input_dtype, max_val = torch.float8_e5m2, DType.FP8e5, 57344
-
-                    weight_scale = 1.
-                    weight = mod.weight.data.float() * weight_scale
-                    scales = torch.abs(weight).amax(axis=1, keepdim=True) / max_val
-                    W_q    = torch.round(weight / scales).to(device=device, dtype=w_dtype)
-                    scales = scales.to(device=device, dtype=compute_dtype)#.float()
+                    #A16W8
+                    weight = mod.weight.data.float()
+                    scales = torch.abs(weight).amax(axis=1, keepdim=True) / 127.0
+                    W_q    = torch.round(weight / scales).to(device=device, dtype=torch.int8)
+                    scales = scales.to(device=device, dtype=compute_dtype)
 
                     gemlite_linear = GemLiteLinearTriton(8, 
                                     group_size=in_features, 
                                     in_features=in_features, 
                                     out_features=out_features, 
-                                    input_dtype=input_dtype,
-                                    output_dtype=DType.FP16,  
+                                    input_dtype=DType.FP16, 
+                                    output_dtype=DType.FP16, 
                                     )
 
-                    def scale_fct(x):
-                        x_shape  = x.shape
-                        out_x    = x.view(-1, x.shape[-1]) 
-                        scaled_x = torch.abs(out_x).amax(axis=1, keepdim=True) / max_val
-                        out_x    = torch.round(out_x / scaled_x).to(dtype=w_dtype)
-                        return out_x.view(x_shape), scaled_x
+                    gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, contiguous=False, packing_bitwidth=32)
+                    gemlite_linear.W_group_mode = 2
+                    gemlite_linear.channel_scale_mode = 0
+                    gemlite_linear.default_gemv = 'GEMV_SPLITK'
 
-                    gemlite_linear.scale_activations = scale_fct
+                    ##########################################################
+                    # #A8W8 Dynamic quantization
+                    # w_dtype, input_dtype, max_val = torch.int8, DType.INT8, 127
+                    # #w_dtype, input_dtype, max_val = torch.float8_e4m3fn, DType.FP8, 448
+                    # #w_dtype, input_dtype, max_val = torch.float8_e5m2, DType.FP8e5, 57344
 
-                    gemlite_linear.pack(W_q, scales / weight_scale, zeros=None, bias=bias, contiguous=False)
-                    gemlite_linear.W_group_mode       = 0
-                    gemlite_linear.channel_scale_mode = 3 #activation[:,None] + weight[None,:]
-                    gemlite_linear.meta_dtype         = DType.FP32
-                    gemlite_linear.default_gemv       = 'GEMV_SPLITK'
+                    # weight_scale = 1.
+                    # weight = mod.weight.data.float() * weight_scale
+                    # scales = torch.abs(weight).amax(axis=1, keepdim=True) / max_val
+                    # W_q    = torch.round(weight / scales).to(device=device, dtype=w_dtype)
+                    # scales = scales.to(device=device, dtype=compute_dtype)#.float()
+
+                    # gemlite_linear = GemLiteLinearTriton(8, 
+                    #                 group_size=in_features, 
+                    #                 in_features=in_features, 
+                    #                 out_features=out_features, 
+                    #                 input_dtype=input_dtype,
+                    #                 output_dtype=DType.FP16,  
+                    #                 )
+
+                    # def scale_fct(x):
+                    #     x_shape  = x.shape
+                    #     out_x    = x.view(-1, x.shape[-1]) 
+                    #     scaled_x = torch.abs(out_x).amax(axis=1, keepdim=True) / max_val
+                    #     out_x    = torch.round(out_x / scaled_x).to(dtype=w_dtype)
+                    #     return out_x.view(x_shape), scaled_x
+
+                    # gemlite_linear.scale_activations = scale_fct
+
+                    # gemlite_linear.pack(W_q, scales / weight_scale, zeros=None, bias=bias, contiguous=False)
+                    # gemlite_linear.W_group_mode       = 0
+                    # gemlite_linear.channel_scale_mode = 3 #activation[:,None] + weight[None,:]
+                    # gemlite_linear.meta_dtype         = DType.FP32
+                    # gemlite_linear.default_gemv       = 'GEMV_SPLITK'
 
                     ########################################################
 
